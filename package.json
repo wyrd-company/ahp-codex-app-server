@@ -1,0 +1,49 @@
+{
+  "name": "@wyrd-company/ahp-codex-app-server",
+  "version": "0.1.0",
+  "description": "Agent Host Protocol provider adapter for Codex App Server.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Wyrd Company",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wyrd-company/ahp-codex-app-server.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test --import tsx test/*.test.ts",
+    "test:live": "scripts/validate-live-codex-app-server.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@microsoft/agent-host-protocol": "^0.3.0",
+    "@wyrd-company/ahp-provider-kit": "file:../ahp-provider-kit",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@wyrd-company/ahp-server": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "@wyrd-company/ahp-server": "file:../ahp-server",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

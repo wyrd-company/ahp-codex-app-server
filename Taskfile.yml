@@ -1,0 +1,22 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Compile TypeScript into dist
+    cmds:
+      - npm run build
+
+  test:
+    desc: Run the local Node test suite
+    cmds:
+      - npm test
+
+  typecheck:
+    desc: Typecheck without emitting JavaScript
+    cmds:
+      - npm run typecheck
+
+  verify:
+    desc: Run typecheck, tests, and build
+    cmds:
+      - npm run verify
