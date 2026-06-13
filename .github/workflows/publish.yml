@@ -6,8 +6,9 @@ on:
       - '*.*.*'
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
+  packages: write
 
 jobs:
   npm:
@@ -37,6 +38,27 @@ jobs:
       - run: npm install
       - run: npm run verify
       - run: npm pack --dry-run
-      - run: npm publish --access public --provenance
+
+      - name: Publish to npmjs
+        run: npm publish --access public --provenance --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@wyrd-company'
+
+      - name: Publish to GitHub Packages
+        run: npm publish --registry https://npm.pkg.github.com --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub release
+        run: |
+          set -euo pipefail
+          title="$(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          gh release create "${GITHUB_REF_NAME}" --title "$title" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
