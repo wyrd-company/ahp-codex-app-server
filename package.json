@@ -10,7 +10,7 @@
     "url": "git+https://github.com/wyrd-company/ahp-codex-app-server.git"
   },
   "files": [
-    "dist",
+    "dist/src",
     "README.md",
     "LICENSE"
   ],
@@ -25,7 +25,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
-    "prepack": "npm run build",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run verify",
     "test": "npm run build && node --test --import tsx test/*.test.ts",
     "test:live": "scripts/validate-live-codex-app-server.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -33,7 +34,7 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "^0.3.0",
-    "@wyrd-company/ahp-provider-kit": "file:../ahp-provider-kit",
+    "@wyrd-company/ahp-provider-kit": "^0.1.0",
     "ws": "^8.18.0"
   },
   "peerDependencies": {
@@ -42,11 +43,14 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
-    "@wyrd-company/ahp-server": "file:../ahp-server",
+    "@wyrd-company/ahp-server": "^0.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
   "overrides": {
     "esbuild": "^0.28.1"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
