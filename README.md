@@ -30,14 +30,10 @@ The provider maps AHP active-client tools to Codex dynamic tools.
 ## Session Resume
 
 The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
-persisted AHP session, the adapter reconnects to Codex App Server and recreates a
-CAS runtime session from the stored AHP working directory, model, config, and
-active-client tools. This restores the provider runtime needed for new turns
-after AHP reconnect.
-
-The current adapter does not persist the CAS `thread.id` into AHP session state,
-so resume creates a new CAS thread. True same-thread CAS continuation requires a
-provider metadata persistence hook in the AHP server.
+persisted AHP session, the adapter reconnects to Codex App Server and calls
+`thread/resume` with the stored CAS `thread.id`. The thread id is stored through
+the provider-owned resume-state hook exposed by `ahp-server`; it is not read
+from client-supplied tool input or AHP session config.
 
 ## Usage
 

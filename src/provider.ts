@@ -17,6 +17,7 @@ import {
   type AgentSession,
   type AgentSessionContext,
   type AgentTurnSink,
+  type ProviderResumeState,
   type ResumableAgentProvider,
   type ResumableAgentSessionContext,
   uriToPath,
@@ -43,6 +44,11 @@ export interface CodexAppServerProviderOptions {
 
 interface ThreadStartResponse {
   readonly thread: { readonly id: string };
+}
+
+interface ThreadResumeResponse {
+  readonly thread: { readonly id: string };
+  readonly model?: string;
 }
 
 interface TurnStartResponse {
@@ -77,6 +83,11 @@ type DynamicToolCallOutputContentItem =
 
 const ACTIVE_CLIENT_TOOL_NAMESPACE = 'ahp_active_client';
 
+interface CodexResumeState extends ProviderResumeState {
+  readonly threadId?: string;
+  readonly model?: string;
+}
+
 export function createCodexAppServerProvider(options: CodexAppServerProviderOptions): ResumableAgentProvider {
   const providerId = options.providerId ?? 'codex';
   const defaultModel = options.defaultModel ?? 'codex';
@@ -87,26 +98,31 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
     defaultModel,
   });
 
-  async function createRuntimeSession(context: AgentSessionContext): Promise<AgentSession> {
+  async function createRuntimeSession(context: AgentSessionContext | ResumableAgentSessionContext): Promise<AgentSession> {
     const client = options.client ?? options.clientFactory?.() ?? createSocketClient(options);
     await client.connect();
     const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
     const model = resolveModelId(context.model, defaultModel);
     const dynamicTools = toDynamicToolSpecs(context.activeClientTools?.tools);
-    const start = await client.request<ThreadStartResponse>('thread/start', {
-      cwd,
-      model,
-      approvalPolicy: options.approvalPolicy ?? 'on-request',
-      sandbox: options.sandbox ?? 'workspace-write',
-      ephemeral: false,
-      sessionStartSource: 'startup',
-      threadSource: 'user',
-      ...(dynamicTools.length ? { dynamicTools } : {}),
-    });
+    const resumeState = resumeStateFromContext(context);
+    const thread = resumeState.threadId
+      ? await resumeThread(client, resumeState.threadId, {
+        cwd,
+        model: resumeState.model ?? model,
+        approvalPolicy: options.approvalPolicy ?? 'on-request',
+        sandbox: options.sandbox ?? 'workspace-write',
+      })
+      : await startThread(client, {
+        cwd,
+        model,
+        approvalPolicy: options.approvalPolicy ?? 'on-request',
+        sandbox: options.sandbox ?? 'workspace-write',
+        dynamicTools,
+      });
     return new CodexAHPAgentSession(
       client,
-      start.thread.id,
-      model,
+      thread.id,
+      resumeState.model ?? thread.model ?? model,
       context.activeClientTools,
       context.activeClientToolSink,
     );
@@ -121,6 +137,49 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
       return createRuntimeSession(context);
     },
   };
+}
+
+async function startThread(
+  client: CodexAppServerClient,
+  options: {
+    readonly cwd: string;
+    readonly model: string;
+    readonly approvalPolicy: NonNullable<CodexAppServerProviderOptions['approvalPolicy']>;
+    readonly sandbox: NonNullable<CodexAppServerProviderOptions['sandbox']>;
+    readonly dynamicTools: DynamicToolSpec[];
+  },
+): Promise<{ id: string; model: string }> {
+  const start = await client.request<ThreadStartResponse>('thread/start', {
+    cwd: options.cwd,
+    model: options.model,
+    approvalPolicy: options.approvalPolicy,
+    sandbox: options.sandbox,
+    ephemeral: false,
+    sessionStartSource: 'startup',
+    threadSource: 'user',
+    ...(options.dynamicTools.length ? { dynamicTools: options.dynamicTools } : {}),
+  });
+  return { id: start.thread.id, model: options.model };
+}
+
+async function resumeThread(
+  client: CodexAppServerClient,
+  threadId: string,
+  options: {
+    readonly cwd: string;
+    readonly model: string;
+    readonly approvalPolicy: NonNullable<CodexAppServerProviderOptions['approvalPolicy']>;
+    readonly sandbox: NonNullable<CodexAppServerProviderOptions['sandbox']>;
+  },
+): Promise<{ id: string; model: string }> {
+  const resume = await client.request<ThreadResumeResponse>('thread/resume', {
+    threadId,
+    cwd: options.cwd,
+    model: options.model,
+    approvalPolicy: options.approvalPolicy,
+    sandbox: options.sandbox,
+  });
+  return { id: resume.thread.id, model: resume.model ?? options.model };
 }
 
 function createSocketClient(options: CodexAppServerProviderOptions): CodexAppServerClient {
@@ -226,6 +285,13 @@ class CodexAHPAgentSession implements AgentSession {
     this.activeClientTools.setActiveClientTools(activeClientTools);
   }
 
+  getResumeState(): CodexResumeState {
+    return {
+      threadId: this.threadId,
+      model: this.model,
+    };
+  }
+
   async cancel(reason?: string): Promise<void> {
     await this.client.request('turn/interrupt', {
       threadId: this.threadId,
@@ -263,6 +329,16 @@ class CodexAHPAgentSession implements AgentSession {
       return dynamicToolErrorResponse(error instanceof Error ? error.message : String(error));
     }
   }
+}
+
+function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSessionContext): CodexResumeState {
+  if (!('resumeState' in context) || !context.resumeState) {
+    return {};
+  }
+  return {
+    ...(typeof context.resumeState.threadId === 'string' ? { threadId: context.resumeState.threadId } : {}),
+    ...(typeof context.resumeState.model === 'string' ? { model: context.resumeState.model } : {}),
+  };
 }
 
 function isThreadNotification(notification: CodexJsonRpcNotification, threadId: string): boolean {

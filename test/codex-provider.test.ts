@@ -180,7 +180,7 @@ test('Codex provider routes dynamic tool calls through active-client tools', asy
   await client.shutdown();
 });
 
-test('Codex provider resumes a persisted AHP session by recreating its CAS runtime session', async () => {
+test('Codex provider resumes a persisted AHP session with the original CAS thread id', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-resume-'));
   const firstCodex = new FakeCodexClient();
   const secondCodex = new FakeCodexClient();
@@ -215,7 +215,8 @@ test('Codex provider resumes a persisted AHP session by recreating its CAS runti
       subscriptions: [sessionUri],
     });
     assert.equal(reconnect.type, 'snapshot');
-    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/start']);
+    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal(secondCodex.requests[0]?.params.threadId, 'codex-thread-1');
     assert.equal(secondCodex.requests[0]?.params.cwd, '/workspaces/project-a');
 
     const subscription = secondClient.attachSubscription(sessionUri);
@@ -226,7 +227,7 @@ test('Codex provider resumes a persisted AHP session by recreating its CAS runti
     } as StateAction);
 
     const actions = await collectUntilTerminal(subscription);
-    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/start', 'turn/start']);
+    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/resume', 'turn/start']);
     assert.equal(secondCodex.requests[1]?.params.threadId, 'codex-thread-1');
     assert.equal(actions.at(-1)?.type, 'session/turnComplete');
 
@@ -266,6 +267,9 @@ class FakeCodexClient implements CodexAppServerClient {
     this.requests.push({ method, params: params as Record<string, unknown> });
     if (method === 'thread/start') {
       return { thread: { id: 'codex-thread-1' } } as T;
+    }
+    if (method === 'thread/resume') {
+      return { thread: { id: (params as { threadId?: string }).threadId ?? 'codex-thread-1' } } as T;
     }
     if (method === 'turn/start') {
       queueMicrotask(() => void this.completeTurn());
