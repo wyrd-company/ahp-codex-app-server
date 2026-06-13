@@ -1,6 +1,6 @@
 {
   "name": "@wyrd-company/ahp-codex-app-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent Host Protocol provider adapter for Codex App Server.",
   "type": "module",
   "license": "MIT",
@@ -34,16 +34,16 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "^0.3.0",
-    "@wyrd-company/ahp-provider-kit": "^0.1.0",
+    "@wyrd-company/ahp-provider-kit": "^0.2.0",
     "ws": "^8.18.0"
   },
   "peerDependencies": {
-    "@wyrd-company/ahp-server": "^0.1.0"
+    "@wyrd-company/ahp-server": "^0.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
-    "@wyrd-company/ahp-server": "^0.1.0",
+    "@wyrd-company/ahp-server": "^0.2.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },

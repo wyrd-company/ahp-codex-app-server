@@ -17,6 +17,8 @@ import {
   type AgentSession,
   type AgentSessionContext,
   type AgentTurnSink,
+  type ResumableAgentProvider,
+  type ResumableAgentSessionContext,
   uriToPath,
 } from '@wyrd-company/ahp-provider-kit';
 import {
@@ -75,7 +77,7 @@ type DynamicToolCallOutputContentItem =
 
 const ACTIVE_CLIENT_TOOL_NAMESPACE = 'ahp_active_client';
 
-export function createCodexAppServerProvider(options: CodexAppServerProviderOptions): AgentProvider {
+export function createCodexAppServerProvider(options: CodexAppServerProviderOptions): ResumableAgentProvider {
   const providerId = options.providerId ?? 'codex';
   const defaultModel = options.defaultModel ?? 'codex';
   const agent: AgentInfo = singleModelAgentInfo({
@@ -85,31 +87,38 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
     defaultModel,
   });
 
+  async function createRuntimeSession(context: AgentSessionContext): Promise<AgentSession> {
+    const client = options.client ?? options.clientFactory?.() ?? createSocketClient(options);
+    await client.connect();
+    const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
+    const model = resolveModelId(context.model, defaultModel);
+    const dynamicTools = toDynamicToolSpecs(context.activeClientTools?.tools);
+    const start = await client.request<ThreadStartResponse>('thread/start', {
+      cwd,
+      model,
+      approvalPolicy: options.approvalPolicy ?? 'on-request',
+      sandbox: options.sandbox ?? 'workspace-write',
+      ephemeral: false,
+      sessionStartSource: 'startup',
+      threadSource: 'user',
+      ...(dynamicTools.length ? { dynamicTools } : {}),
+    });
+    return new CodexAHPAgentSession(
+      client,
+      start.thread.id,
+      model,
+      context.activeClientTools,
+      context.activeClientToolSink,
+    );
+  }
+
   return {
     agent,
-    async createSession(context: AgentSessionContext): Promise<AgentSession> {
-      const client = options.client ?? options.clientFactory?.() ?? createSocketClient(options);
-      await client.connect();
-      const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
-      const model = resolveModelId(context.model, defaultModel);
-      const dynamicTools = toDynamicToolSpecs(context.activeClientTools?.tools);
-      const start = await client.request<ThreadStartResponse>('thread/start', {
-        cwd,
-        model,
-        approvalPolicy: options.approvalPolicy ?? 'on-request',
-        sandbox: options.sandbox ?? 'workspace-write',
-        ephemeral: false,
-        sessionStartSource: 'startup',
-        threadSource: 'user',
-        ...(dynamicTools.length ? { dynamicTools } : {}),
-      });
-      return new CodexAHPAgentSession(
-        client,
-        start.thread.id,
-        model,
-        context.activeClientTools,
-        context.activeClientToolSink,
-      );
+    createSession(context: AgentSessionContext): Promise<AgentSession> {
+      return createRuntimeSession(context);
+    },
+    resumeSession(context: ResumableAgentSessionContext): Promise<AgentSession> {
+      return createRuntimeSession(context);
     },
   };
 }

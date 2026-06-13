@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, test } from 'node:test';
 
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
-import { AhpServer, createInMemoryTransportPair } from '@wyrd-company/ahp-server';
+import { AhpServer, FileSystemSessionStore, createInMemoryTransportPair } from '@wyrd-company/ahp-server';
 
 import {
   createCodexAppServerProvider,
@@ -177,6 +180,62 @@ test('Codex provider routes dynamic tool calls through active-client tools', asy
   await client.shutdown();
 });
 
+test('Codex provider resumes a persisted AHP session by recreating its CAS runtime session', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-resume-'));
+  const firstCodex = new FakeCodexClient();
+  const secondCodex = new FakeCodexClient();
+  const sessionUri = 'ahp-session:/codex-resume';
+
+  try {
+    const firstServer = new AhpServer({
+      providers: [createCodexAppServerProvider({ client: firstCodex, defaultModel: 'gpt-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const firstClient = createClient(firstServer);
+    firstClient.connect();
+    await firstClient.initialize({ clientId: 'codex-client', protocolVersions: ['0.3.0'] });
+    await firstClient.request('createSession', {
+      channel: sessionUri,
+      provider: 'codex',
+      workingDirectory: 'file:///workspaces/project-a',
+      model: { id: 'gpt-test' },
+    });
+    await firstClient.shutdown();
+
+    const secondServer = new AhpServer({
+      providers: [createCodexAppServerProvider({ client: secondCodex, defaultModel: 'gpt-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const secondClient = createClient(secondServer);
+    secondClient.connect();
+
+    const reconnect = await secondClient.reconnect({
+      clientId: 'codex-client',
+      lastSeenServerSeq: 0,
+      subscriptions: [sessionUri],
+    });
+    assert.equal(reconnect.type, 'snapshot');
+    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/start']);
+    assert.equal(secondCodex.requests[0]?.params.cwd, '/workspaces/project-a');
+
+    const subscription = secondClient.attachSubscription(sessionUri);
+    secondClient.dispatch(sessionUri, {
+      type: 'session/turnStarted',
+      turnId: 'resume-turn',
+      message: userMessage('Continue after reconnect'),
+    } as StateAction);
+
+    const actions = await collectUntilTerminal(subscription);
+    assert.deepEqual(secondCodex.requests.map(request => request.method), ['thread/start', 'turn/start']);
+    assert.equal(secondCodex.requests[1]?.params.threadId, 'codex-thread-1');
+    assert.equal(actions.at(-1)?.type, 'session/turnComplete');
+
+    await secondClient.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 interface RecordedRequest {
   method: string;
   params: Record<string, unknown>;
@@ -292,6 +351,12 @@ class FakeCodexClient implements CodexAppServerClient {
   }
 }
 
+function createClient(server: AhpServer): AhpClient {
+  const [clientTransport, serverTransport] = createInMemoryTransportPair();
+  runningServers.push(server.accept(serverTransport));
+  return new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
+}
+
 function toolDefinition(name: string, title: string): ToolDefinition {
   return {
     name,
@@ -320,4 +385,17 @@ async function nextAction(subscription: AsyncIterator<unknown>): Promise<{ actio
   assert.equal(value.type, 'action');
   assert.ok(value.params?.action);
   return { action: value.params.action };
+}
+
+async function collectUntilTerminal(subscription: AsyncIterator<unknown>): Promise<StateAction[]> {
+  const actions: StateAction[] = [];
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const { action } = await nextAction(subscription);
+    actions.push(action);
+    if (action.type === 'session/turnComplete' || action.type === 'session/error') {
+      return actions;
+    }
+  }
+  throw new Error(`timed out waiting for terminal action; saw ${actions.map(action => action.type).join(', ')}`);
 }

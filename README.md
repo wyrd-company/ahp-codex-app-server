@@ -27,6 +27,18 @@ The provider maps AHP active-client tools to Codex dynamic tools.
 - AHP owns session URI, turn id, tool call id, tool name, and active-client identity. Tool input is passed through as display/input data only.
 - Only the active client that owns the tool call can complete it through normal AHP `session/toolCallComplete`.
 
+## Session Resume
+
+The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
+persisted AHP session, the adapter reconnects to Codex App Server and recreates a
+CAS runtime session from the stored AHP working directory, model, config, and
+active-client tools. This restores the provider runtime needed for new turns
+after AHP reconnect.
+
+The current adapter does not persist the CAS `thread.id` into AHP session state,
+so resume creates a new CAS thread. True same-thread CAS continuation requires a
+provider metadata persistence hook in the AHP server.
+
 ## Usage
 
 ```ts
