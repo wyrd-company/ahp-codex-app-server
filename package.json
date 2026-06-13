@@ -45,5 +45,8 @@
     "@wyrd-company/ahp-server": "file:../ahp-server",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }
