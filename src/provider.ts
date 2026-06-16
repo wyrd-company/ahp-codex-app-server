@@ -1,10 +1,12 @@
 import type {
   AgentInfo,
   Message,
+  StateAction,
   StringOrMarkdown,
   ToolCallResult,
   ToolDefinition,
   ToolResultContent,
+  UsageInfo,
 } from '@microsoft/agent-host-protocol';
 
 import {
@@ -53,6 +55,20 @@ interface ThreadResumeResponse {
 
 interface TurnStartResponse {
   readonly turn: { readonly id: string };
+}
+
+interface TokenUsageBreakdown {
+  readonly totalTokens: number;
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+}
+
+interface ThreadTokenUsage {
+  readonly total: TokenUsageBreakdown;
+  readonly last: TokenUsageBreakdown;
+  readonly modelContextWindow: number | null;
 }
 
 interface DynamicToolSpec {
@@ -214,6 +230,7 @@ class CodexAHPAgentSession implements AgentSession {
     const ahpTurnId = turnId ?? `turn-${Date.now()}`;
     const markdown = new MarkdownTurnEmitter(sink, ahpTurnId);
     let codexTurnId: string | undefined;
+    let latestTokenUsage: ThreadTokenUsage | undefined;
     let complete: (() => void) | undefined;
     let fail: ((error: Error) => void) | undefined;
 
@@ -241,9 +258,17 @@ class CodexAHPAgentSession implements AgentSession {
           markdown.emitDelta(params.delta ?? '');
           return;
         }
+        if (notification.method === 'thread/tokenUsage/updated') {
+          const params = notification.params as { turnId?: string; tokenUsage?: ThreadTokenUsage };
+          if (!params.turnId || !codexTurnId || params.turnId === codexTurnId) {
+            latestTokenUsage = params.tokenUsage ?? latestTokenUsage;
+          }
+          return;
+        }
         if (notification.method === 'turn/completed') {
           const params = notification.params as { turn?: { id?: string } };
           codexTurnId = params.turn?.id ?? codexTurnId;
+          sink.emit(usageAction(ahpTurnId, usageInfo(latestTokenUsage, this.model)));
           markdown.complete();
           complete?.();
           return;
@@ -344,6 +369,60 @@ function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSes
 function isThreadNotification(notification: CodexJsonRpcNotification, threadId: string): boolean {
   const params = notification.params as { threadId?: string } | undefined;
   return params?.threadId === undefined || params.threadId === threadId;
+}
+
+function usageAction(turnId: string, usage: UsageInfo): StateAction {
+  return {
+    type: 'session/usage',
+    turnId,
+    usage,
+  } as StateAction;
+}
+
+function usageInfo(tokenUsage: ThreadTokenUsage | undefined, model: string): UsageInfo {
+  if (!tokenUsage) {
+    return unavailableUsageInfo(model, 'Codex App Server did not emit thread/tokenUsage/updated for this turn');
+  }
+
+  const totalTokens = finiteNumber(tokenUsage.total.totalTokens);
+  const maxContextWindow = finiteNumber(tokenUsage.modelContextWindow);
+  const usageRatio = totalTokens !== undefined && maxContextWindow
+    ? totalTokens / maxContextWindow
+    : undefined;
+
+  return {
+    inputTokens: finiteNumber(tokenUsage.last.inputTokens),
+    outputTokens: finiteNumber(tokenUsage.last.outputTokens),
+    model,
+    cacheReadTokens: finiteNumber(tokenUsage.last.cachedInputTokens),
+    _meta: {
+      wyrdContextUsage: {
+        ...(totalTokens !== undefined ? { totalTokens } : {}),
+        ...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
+        ...(usageRatio !== undefined ? { usageRatio } : {}),
+        confidence: 'measured',
+        source: 'provider-api',
+      },
+      codexThreadTokenUsage: tokenUsage,
+    },
+  };
+}
+
+function unavailableUsageInfo(model: string, reason: string): UsageInfo {
+  return {
+    model,
+    _meta: {
+      wyrdContextUsage: {
+        confidence: 'unavailable',
+        source: 'unavailable',
+        reason,
+      },
+    },
+  };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function toDynamicToolSpecs(tools: readonly ToolDefinition[] | undefined): DynamicToolSpec[] {

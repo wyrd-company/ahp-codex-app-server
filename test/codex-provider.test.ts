@@ -51,6 +51,7 @@ test('Codex provider maps an AHP turn to CAS thread and turn requests', async ()
     await subscription.next(),
     await subscription.next(),
     await subscription.next(),
+    await subscription.next(),
   ].map(event => {
     assert.equal(event.done, false);
     assert.equal(event.value.type, 'action');
@@ -71,8 +72,10 @@ test('Codex provider maps an AHP turn to CAS thread and turn requests', async ()
   assert.equal(events[2]?.type, 'session/delta');
   assert.equal((events[2] as { turnId?: string }).turnId, 'ahp-turn-1');
   assert.equal((events[2] as { content?: string }).content, 'Codex says hello');
-  assert.equal(events[3]?.type, 'session/turnComplete');
-  assert.equal((events[3] as { turnId?: string }).turnId, 'ahp-turn-1');
+  assert.equal(events[3]?.type, 'session/usage');
+  assert.deepEqual((events[3] as { usage?: unknown }).usage, codexUsageInfo());
+  assert.equal(events[4]?.type, 'session/turnComplete');
+  assert.equal((events[4] as { turnId?: string }).turnId, 'ahp-turn-1');
 
   await client.shutdown();
 });
@@ -169,6 +172,8 @@ test('Codex provider routes dynamic tool calls through active-client tools', asy
   const delta = await nextAction(subscription);
   assert.equal(delta.action.type, 'session/delta');
   assert.equal((delta.action as { content?: string }).content, 'Codex says hello');
+  const usage = await nextAction(subscription);
+  assert.equal(usage.action.type, 'session/usage');
   const turnComplete = await nextAction(subscription);
   assert.equal(turnComplete.action.type, 'session/turnComplete');
 
@@ -314,6 +319,14 @@ class FakeCodexClient implements CodexAppServerClient {
       },
     });
     this.emit({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'codex-thread-1',
+        turnId: 'codex-turn-1',
+        tokenUsage: codexThreadTokenUsage(),
+      },
+    });
+    this.emit({
       method: 'turn/completed',
       params: {
         threadId: 'codex-thread-1',
@@ -353,6 +366,45 @@ class FakeCodexClient implements CodexAppServerClient {
       listener(notification);
     }
   }
+}
+
+function codexThreadTokenUsage() {
+  return {
+    total: {
+      totalTokens: 45_000,
+      inputTokens: 42_000,
+      cachedInputTokens: 10_000,
+      outputTokens: 3_000,
+      reasoningOutputTokens: 750,
+    },
+    last: {
+      totalTokens: 4_500,
+      inputTokens: 4_200,
+      cachedInputTokens: 1_000,
+      outputTokens: 300,
+      reasoningOutputTokens: 75,
+    },
+    modelContextWindow: 200_000,
+  };
+}
+
+function codexUsageInfo() {
+  return {
+    inputTokens: 4_200,
+    outputTokens: 300,
+    model: 'gpt-test',
+    cacheReadTokens: 1_000,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens: 45_000,
+        maxContextWindow: 200_000,
+        usageRatio: 0.225,
+        confidence: 'measured',
+        source: 'provider-api',
+      },
+      codexThreadTokenUsage: codexThreadTokenUsage(),
+    },
+  };
 }
 
 function createClient(server: AhpServer): AhpClient {

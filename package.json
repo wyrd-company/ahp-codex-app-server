@@ -1,6 +1,6 @@
 {
   "name": "@wyrd-company/ahp-codex-app-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Agent Host Protocol provider adapter for Codex App Server.",
   "type": "module",
   "license": "MIT",
