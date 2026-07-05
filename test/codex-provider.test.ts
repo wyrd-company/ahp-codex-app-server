@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { AhpServer, FileSystemSessionStore, createInMemoryTransportPair } from '@wyrd-company/ahp-server';
+import type { ResumableAgentSessionContext } from '@wyrd-company/ahp-provider-kit';
 
 import {
   createCodexAppServerProvider,
@@ -95,6 +96,7 @@ test('Codex provider mirrors rollout files to configured AHP session storage aft
     const provider = createCodexAppServerProvider({
       client: codex,
       defaultModel: 'gpt-test',
+      codexHome: join(directory, 'codex-home'),
       sessionStorage: () => pathToFileURL(mirrorDir).href,
     });
     const server = new AhpServer({ providers: [provider] });
@@ -126,17 +128,210 @@ test('Codex provider mirrors rollout files to configured AHP session storage aft
     const metadata = JSON.parse(readFileSync(join(mirrorDir, 'codex-session.json'), 'utf8')) as {
       threadId?: string;
       model?: string;
-      sourceRolloutPath?: string;
-      mirroredRolloutPath?: string;
+      rolloutRelativePath?: string;
+      mirroredRolloutFileName?: string;
       mirroredAt?: string;
     };
     assert.equal(metadata.threadId, 'codex-thread-1');
     assert.equal(metadata.model, 'gpt-test');
-    assert.equal(metadata.sourceRolloutPath, rolloutPath);
-    assert.equal(metadata.mirroredRolloutPath, mirroredRolloutPath);
+    assert.equal(metadata.rolloutRelativePath, join('sessions', '2026', '07', '05', basename(rolloutPath)));
+    assert.equal(metadata.mirroredRolloutFileName, basename(rolloutPath));
     assert.equal(typeof metadata.mirroredAt, 'string');
 
     await client.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex provider resumes without restoring when the native rollout exists', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-native-resume-'));
+  const codexHome = join(directory, 'codex-home');
+  const rolloutRelativePath = join('sessions', '2026', '07', '05', 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const rolloutPath = join(codexHome, rolloutRelativePath);
+  const mirrorDir = join(directory, 'task', 'sessions', 'codex');
+  const codex = new FakeCodexClient({ rolloutPath });
+
+  try {
+    mkdirSync(dirname(rolloutPath), { recursive: true });
+    mkdirSync(mirrorDir, { recursive: true });
+    writeFileSync(rolloutPath, 'native rollout\n', 'utf8');
+    writeFileSync(join(mirrorDir, basename(rolloutPath)), 'mirrored rollout\n', 'utf8');
+    writeFileSync(join(mirrorDir, 'codex-session.json'), JSON.stringify({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutRelativePath,
+      mirroredRolloutFileName: basename(rolloutPath),
+    }), 'utf8');
+
+    const provider = createCodexAppServerProvider({
+      client: codex,
+      defaultModel: 'gpt-test',
+      codexHome,
+      sessionStorage: () => pathToFileURL(mirrorDir).href,
+    });
+
+    await provider.resumeSession(resumeContext({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutPath,
+      rolloutRelativePath,
+      mirroredRolloutFileName: basename(rolloutPath),
+    }));
+
+    assert.equal(readFileSync(rolloutPath, 'utf8'), 'native rollout\n');
+    assert.deepEqual(codex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal(codex.requests[0]?.params.threadId, 'codex-thread-1');
+    assert.equal('path' in codex.requests[0]!.params, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex provider restores a missing native rollout from the resolved session storage mirror', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-restore-resume-'));
+  const codexHome = join(directory, 'codex-home');
+  const rolloutRelativePath = join('sessions', '2026', '07', '05', 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const rolloutPath = join(codexHome, rolloutRelativePath);
+  const mirrorDir = join(directory, 'task', 'sessions', 'codex');
+  const mirrorPath = join(mirrorDir, basename(rolloutPath));
+  const codex = new FakeCodexClient({ rolloutPath });
+
+  try {
+    mkdirSync(mirrorDir, { recursive: true });
+    writeFileSync(mirrorPath, 'mirrored rollout\n', 'utf8');
+    writeFileSync(join(mirrorDir, 'codex-session.json'), JSON.stringify({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutRelativePath,
+      mirroredRolloutFileName: basename(rolloutPath),
+    }), 'utf8');
+
+    const provider = createCodexAppServerProvider({
+      client: codex,
+      defaultModel: 'gpt-test',
+      codexHome,
+      sessionStorage: () => pathToFileURL(mirrorDir).href,
+    });
+
+    await provider.resumeSession(resumeContext({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutPath,
+      rolloutRelativePath,
+      mirroredRolloutFileName: basename(rolloutPath),
+    }));
+
+    assert.equal(readFileSync(rolloutPath, 'utf8'), 'mirrored rollout\n');
+    assert.deepEqual(codex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal('path' in codex.requests[0]!.params, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex provider restores from the newly resolved storage directory when resume state has an old mirror path', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-moved-resume-'));
+  const oldRoot = join(directory, 'old-machine');
+  const newRoot = join(directory, 'new-machine');
+  const oldCodexHome = join(oldRoot, 'codex-home');
+  const newCodexHome = join(newRoot, 'codex-home');
+  const rolloutRelativePath = join('sessions', '2026', '07', '05', 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const oldRolloutPath = join(oldCodexHome, rolloutRelativePath);
+  const newRolloutPath = join(newCodexHome, rolloutRelativePath);
+  const oldMirrorPath = join(oldRoot, 'task', 'sessions', 'codex', basename(newRolloutPath));
+  const newMirrorDir = join(newRoot, 'task', 'sessions', 'codex');
+  const codex = new FakeCodexClient({ rolloutPath: newRolloutPath });
+
+  try {
+    mkdirSync(newMirrorDir, { recursive: true });
+    writeFileSync(join(newMirrorDir, basename(newRolloutPath)), 'moved mirrored rollout\n', 'utf8');
+    writeFileSync(join(newMirrorDir, 'codex-session.json'), JSON.stringify({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutRelativePath,
+      mirroredRolloutFileName: basename(newRolloutPath),
+    }), 'utf8');
+
+    const provider = createCodexAppServerProvider({
+      client: codex,
+      defaultModel: 'gpt-test',
+      codexHome: newCodexHome,
+      sessionStorage: () => pathToFileURL(newMirrorDir).href,
+    });
+
+    await provider.resumeSession(resumeContext({
+      threadId: 'codex-thread-1',
+      model: 'gpt-test',
+      rolloutPath: oldRolloutPath,
+      mirroredRolloutPath: oldMirrorPath,
+    }));
+
+    assert.equal(readFileSync(newRolloutPath, 'utf8'), 'moved mirrored rollout\n');
+    assert.deepEqual(codex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal('path' in codex.requests[0]!.params, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex provider attempts resume unchanged when neither native nor mirrored rollout is present', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-missing-resume-'));
+  const codexHome = join(directory, 'codex-home');
+  const rolloutPath = join(codexHome, 'sessions', '2026', '07', '05', 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const mirrorDir = join(directory, 'task', 'sessions', 'codex');
+  const codex = new FakeCodexClient({ rolloutPath });
+
+  try {
+    mkdirSync(mirrorDir, { recursive: true });
+    const warnings = await captureConsoleWarn(async () => {
+      const provider = createCodexAppServerProvider({
+        client: codex,
+        defaultModel: 'gpt-test',
+        codexHome,
+        sessionStorage: () => pathToFileURL(mirrorDir).href,
+      });
+
+      await provider.resumeSession(resumeContext({
+        threadId: 'codex-thread-1',
+        model: 'gpt-test',
+        rolloutPath,
+      }));
+    });
+
+    assert.deepEqual(codex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal(existsSync(rolloutPath), false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] ?? '', /no mirrored rollout was found/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex provider leaves the resume path untouched when session storage is unset', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-no-storage-resume-'));
+  const codexHome = join(directory, 'codex-home');
+  const rolloutPath = join(codexHome, 'sessions', '2026', '07', '05', 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const codex = new FakeCodexClient({ rolloutPath });
+
+  try {
+    const warnings = await captureConsoleWarn(async () => {
+      const provider = createCodexAppServerProvider({
+        client: codex,
+        defaultModel: 'gpt-test',
+        codexHome,
+      });
+
+      await provider.resumeSession(resumeContext({
+        threadId: 'codex-thread-1',
+        model: 'gpt-test',
+        rolloutPath,
+      }));
+    });
+
+    assert.deepEqual(codex.requests.map(request => request.method), ['thread/resume']);
+    assert.equal(existsSync(rolloutPath), false);
+    assert.deepEqual(warnings, []);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -479,6 +674,35 @@ function createClient(server: AhpServer): AhpClient {
   const [clientTransport, serverTransport] = createInMemoryTransportPair();
   runningServers.push(server.accept(serverTransport));
   return new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
+}
+
+function resumeContext(resumeState: Record<string, unknown>): ResumableAgentSessionContext {
+  return {
+    sessionUri: 'ahp-session:/codex-resume',
+    providerId: 'codex',
+    workingDirectory: 'file:///workspaces/project-a',
+    state: {},
+    resumeState,
+    activeClientToolSink: {
+      async reportInvocation(): Promise<never> {
+        throw new Error('unexpected active-client tool invocation');
+      },
+    },
+  } as unknown as ResumableAgentSessionContext;
+}
+
+async function captureConsoleWarn(action: () => Promise<void>): Promise<string[]> {
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...values: unknown[]) => {
+    warnings.push(values.map(String).join(' '));
+  };
+  try {
+    await action();
+    return warnings;
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
 function toolDefinition(name: string, title: string): ToolDefinition {

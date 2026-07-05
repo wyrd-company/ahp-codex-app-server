@@ -34,6 +34,12 @@ import {
   type CodexJsonRpcNotification,
   type CodexServerRequestEvent,
 } from './rpc-client.js';
+import {
+  relativeRolloutPath,
+  resolveCodexHome,
+  restoreMirroredRolloutForResume,
+  type CodexRolloutResumeState,
+} from './rollout-storage.js';
 
 export interface CodexAppServerProviderOptions {
   readonly socketPath?: string;
@@ -47,6 +53,7 @@ export interface CodexAppServerProviderOptions {
   readonly approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
   readonly sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly sessionStorage?: SessionStorage;
+  readonly codexHome?: string;
 }
 
 interface CodexThreadInfo {
@@ -109,11 +116,9 @@ type DynamicToolCallOutputContentItem =
 
 const ACTIVE_CLIENT_TOOL_NAMESPACE = 'ahp_active_client';
 
-interface CodexResumeState extends ProviderResumeState {
+interface CodexResumeState extends ProviderResumeState, CodexRolloutResumeState {
   readonly threadId?: string;
   readonly model?: string;
-  readonly rolloutPath?: string;
-  readonly mirroredRolloutPath?: string;
 }
 
 export function createCodexAppServerProvider(options: CodexAppServerProviderOptions): ResumableAgentProvider {
@@ -135,6 +140,10 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
     const resumeState = resumeStateFromContext(context);
     const sessionStorageUri = resolveSessionStorageDir(options.sessionStorage, context);
     const sessionStoragePath = sessionStorageUri ? uriToPath(sessionStorageUri) : undefined;
+    const codexHome = resolveCodexHome(options.codexHome);
+    const restoredRolloutPath = resumeState.threadId && sessionStoragePath
+      ? await restoreMirroredRolloutForResume(resumeState, sessionStoragePath, codexHome)
+      : undefined;
     const thread = resumeState.threadId
       ? await resumeThread(client, resumeState.threadId, {
         cwd,
@@ -153,9 +162,11 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
       client,
       thread.id,
       resumeState.model ?? thread.model ?? model,
-      thread.rolloutPath ?? resumeState.rolloutPath,
-      resumeState.mirroredRolloutPath,
+      thread.rolloutPath ?? restoredRolloutPath ?? resumeState.rolloutPath,
+      resumeState.rolloutRelativePath ?? relativeRolloutPath(thread.rolloutPath ?? restoredRolloutPath ?? resumeState.rolloutPath, codexHome),
+      resumeState.mirroredRolloutFileName,
       sessionStoragePath,
+      codexHome,
       context.activeClientTools,
       context.activeClientToolSink,
     );
@@ -235,8 +246,10 @@ class CodexAHPAgentSession implements AgentSession {
     private readonly threadId: string,
     private readonly model: string,
     private readonly rolloutPath: string | undefined,
-    private mirroredRolloutPath: string | undefined,
+    private rolloutRelativePath: string | undefined,
+    private mirroredRolloutFileName: string | undefined,
     private readonly sessionStoragePath: string | undefined,
+    private readonly codexHome: string,
     activeClientTools: ActiveClientTools | undefined,
     activeClientToolSink: AgentSessionContext['activeClientToolSink'],
   ) {
@@ -337,7 +350,8 @@ class CodexAHPAgentSession implements AgentSession {
       threadId: this.threadId,
       model: this.model,
       ...(this.rolloutPath ? { rolloutPath: this.rolloutPath } : {}),
-      ...(this.mirroredRolloutPath ? { mirroredRolloutPath: this.mirroredRolloutPath } : {}),
+      ...(this.rolloutRelativePath ? { rolloutRelativePath: this.rolloutRelativePath } : {}),
+      ...(this.mirroredRolloutFileName ? { mirroredRolloutFileName: this.mirroredRolloutFileName } : {}),
     };
   }
 
@@ -388,19 +402,21 @@ class CodexAHPAgentSession implements AgentSession {
     }
 
     await mkdir(this.sessionStoragePath, { recursive: true });
-    const destinationPath = join(this.sessionStoragePath, basename(this.rolloutPath));
+    const rolloutFileName = basename(this.rolloutPath);
+    const destinationPath = join(this.sessionStoragePath, rolloutFileName);
     const temporaryPath = `${destinationPath}.tmp-${process.pid}-${Date.now()}`;
     await copyFile(this.rolloutPath, temporaryPath);
     await rename(temporaryPath, destinationPath);
-    this.mirroredRolloutPath = destinationPath;
+    this.mirroredRolloutFileName = rolloutFileName;
+    this.rolloutRelativePath = relativeRolloutPath(this.rolloutPath, this.codexHome);
 
     const metadataPath = join(this.sessionStoragePath, 'codex-session.json');
     const temporaryMetadataPath = `${metadataPath}.tmp-${process.pid}-${Date.now()}`;
     await writeFile(temporaryMetadataPath, `${JSON.stringify({
       threadId: this.threadId,
       model: this.model,
-      sourceRolloutPath: this.rolloutPath,
-      mirroredRolloutPath: destinationPath,
+      ...(this.rolloutRelativePath ? { rolloutRelativePath: this.rolloutRelativePath } : {}),
+      mirroredRolloutFileName: rolloutFileName,
       mirroredAt: new Date().toISOString(),
     }, null, 2)}\n`, 'utf8');
     await rename(temporaryMetadataPath, metadataPath);
@@ -416,6 +432,8 @@ function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSes
     ...(typeof context.resumeState.model === 'string' ? { model: context.resumeState.model } : {}),
     ...(typeof context.resumeState.rolloutPath === 'string' ? { rolloutPath: context.resumeState.rolloutPath } : {}),
     ...(typeof context.resumeState.mirroredRolloutPath === 'string' ? { mirroredRolloutPath: context.resumeState.mirroredRolloutPath } : {}),
+    ...(typeof context.resumeState.rolloutRelativePath === 'string' ? { rolloutRelativePath: context.resumeState.rolloutRelativePath } : {}),
+    ...(typeof context.resumeState.mirroredRolloutFileName === 'string' ? { mirroredRolloutFileName: context.resumeState.mirroredRolloutFileName } : {}),
   };
 }
 
