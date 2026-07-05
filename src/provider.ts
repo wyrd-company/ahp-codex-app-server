@@ -8,10 +8,13 @@ import type {
   ToolResultContent,
   UsageInfo,
 } from '@microsoft/agent-host-protocol';
+import { copyFile, mkdir, rename, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 
 import {
   ActiveClientToolRouter,
   MarkdownTurnEmitter,
+  resolveSessionStorageDir,
   resolveModelId,
   singleModelAgentInfo,
   type ActiveClientTools,
@@ -22,6 +25,7 @@ import {
   type ProviderResumeState,
   type ResumableAgentProvider,
   type ResumableAgentSessionContext,
+  type SessionStorage,
   uriToPath,
 } from '@wyrd-company/ahp-provider-kit';
 import {
@@ -42,14 +46,20 @@ export interface CodexAppServerProviderOptions {
   readonly defaultModel?: string;
   readonly approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
   readonly sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  readonly sessionStorage?: SessionStorage;
+}
+
+interface CodexThreadInfo {
+  readonly id: string;
+  readonly path?: string | null;
 }
 
 interface ThreadStartResponse {
-  readonly thread: { readonly id: string };
+  readonly thread: CodexThreadInfo;
 }
 
 interface ThreadResumeResponse {
-  readonly thread: { readonly id: string };
+  readonly thread: CodexThreadInfo;
   readonly model?: string;
 }
 
@@ -102,6 +112,8 @@ const ACTIVE_CLIENT_TOOL_NAMESPACE = 'ahp_active_client';
 interface CodexResumeState extends ProviderResumeState {
   readonly threadId?: string;
   readonly model?: string;
+  readonly rolloutPath?: string;
+  readonly mirroredRolloutPath?: string;
 }
 
 export function createCodexAppServerProvider(options: CodexAppServerProviderOptions): ResumableAgentProvider {
@@ -121,6 +133,8 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
     const model = resolveModelId(context.model, defaultModel);
     const dynamicTools = toDynamicToolSpecs(context.activeClientTools?.tools);
     const resumeState = resumeStateFromContext(context);
+    const sessionStorageUri = resolveSessionStorageDir(options.sessionStorage, context);
+    const sessionStoragePath = sessionStorageUri ? uriToPath(sessionStorageUri) : undefined;
     const thread = resumeState.threadId
       ? await resumeThread(client, resumeState.threadId, {
         cwd,
@@ -139,6 +153,9 @@ export function createCodexAppServerProvider(options: CodexAppServerProviderOpti
       client,
       thread.id,
       resumeState.model ?? thread.model ?? model,
+      thread.rolloutPath ?? resumeState.rolloutPath,
+      resumeState.mirroredRolloutPath,
+      sessionStoragePath,
       context.activeClientTools,
       context.activeClientToolSink,
     );
@@ -164,7 +181,7 @@ async function startThread(
     readonly sandbox: NonNullable<CodexAppServerProviderOptions['sandbox']>;
     readonly dynamicTools: DynamicToolSpec[];
   },
-): Promise<{ id: string; model: string }> {
+): Promise<{ id: string; model: string; rolloutPath?: string }> {
   const start = await client.request<ThreadStartResponse>('thread/start', {
     cwd: options.cwd,
     model: options.model,
@@ -175,7 +192,7 @@ async function startThread(
     threadSource: 'user',
     ...(options.dynamicTools.length ? { dynamicTools: options.dynamicTools } : {}),
   });
-  return { id: start.thread.id, model: options.model };
+  return { id: start.thread.id, model: options.model, rolloutPath: start.thread.path ?? undefined };
 }
 
 async function resumeThread(
@@ -187,7 +204,7 @@ async function resumeThread(
     readonly approvalPolicy: NonNullable<CodexAppServerProviderOptions['approvalPolicy']>;
     readonly sandbox: NonNullable<CodexAppServerProviderOptions['sandbox']>;
   },
-): Promise<{ id: string; model: string }> {
+): Promise<{ id: string; model: string; rolloutPath?: string }> {
   const resume = await client.request<ThreadResumeResponse>('thread/resume', {
     threadId,
     cwd: options.cwd,
@@ -195,7 +212,7 @@ async function resumeThread(
     approvalPolicy: options.approvalPolicy,
     sandbox: options.sandbox,
   });
-  return { id: resume.thread.id, model: resume.model ?? options.model };
+  return { id: resume.thread.id, model: resume.model ?? options.model, rolloutPath: resume.thread.path ?? undefined };
 }
 
 function createSocketClient(options: CodexAppServerProviderOptions): CodexAppServerClient {
@@ -217,6 +234,9 @@ class CodexAHPAgentSession implements AgentSession {
     private readonly client: CodexAppServerClient,
     private readonly threadId: string,
     private readonly model: string,
+    private readonly rolloutPath: string | undefined,
+    private mirroredRolloutPath: string | undefined,
+    private readonly sessionStoragePath: string | undefined,
     activeClientTools: ActiveClientTools | undefined,
     activeClientToolSink: AgentSessionContext['activeClientToolSink'],
   ) {
@@ -268,9 +288,11 @@ class CodexAHPAgentSession implements AgentSession {
         if (notification.method === 'turn/completed') {
           const params = notification.params as { turn?: { id?: string } };
           codexTurnId = params.turn?.id ?? codexTurnId;
-          sink.emit(usageAction(ahpTurnId, usageInfo(latestTokenUsage, this.model)));
-          markdown.complete();
-          complete?.();
+          void this.mirrorCodexRollout().then(() => {
+            sink.emit(usageAction(ahpTurnId, usageInfo(latestTokenUsage, this.model)));
+            markdown.complete();
+            complete?.();
+          }, error => fail?.(error instanceof Error ? error : new Error(String(error))));
           return;
         }
         if (notification.method === 'error') {
@@ -314,6 +336,8 @@ class CodexAHPAgentSession implements AgentSession {
     return {
       threadId: this.threadId,
       model: this.model,
+      ...(this.rolloutPath ? { rolloutPath: this.rolloutPath } : {}),
+      ...(this.mirroredRolloutPath ? { mirroredRolloutPath: this.mirroredRolloutPath } : {}),
     };
   }
 
@@ -354,6 +378,33 @@ class CodexAHPAgentSession implements AgentSession {
       return dynamicToolErrorResponse(error instanceof Error ? error.message : String(error));
     }
   }
+
+  private async mirrorCodexRollout(): Promise<void> {
+    if (!this.sessionStoragePath) {
+      return;
+    }
+    if (!this.rolloutPath) {
+      throw new Error('Codex App Server did not expose a rollout path for session mirroring');
+    }
+
+    await mkdir(this.sessionStoragePath, { recursive: true });
+    const destinationPath = join(this.sessionStoragePath, basename(this.rolloutPath));
+    const temporaryPath = `${destinationPath}.tmp-${process.pid}-${Date.now()}`;
+    await copyFile(this.rolloutPath, temporaryPath);
+    await rename(temporaryPath, destinationPath);
+    this.mirroredRolloutPath = destinationPath;
+
+    const metadataPath = join(this.sessionStoragePath, 'codex-session.json');
+    const temporaryMetadataPath = `${metadataPath}.tmp-${process.pid}-${Date.now()}`;
+    await writeFile(temporaryMetadataPath, `${JSON.stringify({
+      threadId: this.threadId,
+      model: this.model,
+      sourceRolloutPath: this.rolloutPath,
+      mirroredRolloutPath: destinationPath,
+      mirroredAt: new Date().toISOString(),
+    }, null, 2)}\n`, 'utf8');
+    await rename(temporaryMetadataPath, metadataPath);
+  }
 }
 
 function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSessionContext): CodexResumeState {
@@ -363,6 +414,8 @@ function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSes
   return {
     ...(typeof context.resumeState.threadId === 'string' ? { threadId: context.resumeState.threadId } : {}),
     ...(typeof context.resumeState.model === 'string' ? { model: context.resumeState.model } : {}),
+    ...(typeof context.resumeState.rolloutPath === 'string' ? { rolloutPath: context.resumeState.rolloutPath } : {}),
+    ...(typeof context.resumeState.mirroredRolloutPath === 'string' ? { mirroredRolloutPath: context.resumeState.mirroredRolloutPath } : {}),
   };
 }
 

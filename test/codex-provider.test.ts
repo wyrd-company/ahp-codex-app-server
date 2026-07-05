@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
@@ -78,6 +79,67 @@ test('Codex provider maps an AHP turn to CAS thread and turn requests', async ()
   assert.equal((events[4] as { turnId?: string }).turnId, 'ahp-turn-1');
 
   await client.shutdown();
+});
+
+test('Codex provider mirrors rollout files to configured AHP session storage after completed turns', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-codex-mirror-'));
+  const rolloutDir = join(directory, 'codex-home', 'sessions', '2026', '07', '05');
+  const rolloutPath = join(rolloutDir, 'rollout-2026-07-05T00-00-00-codex-thread-1.jsonl');
+  const mirrorDir = join(directory, 'task', 'sessions', 'codex');
+
+  try {
+    mkdirSync(rolloutDir, { recursive: true });
+    writeFileSync(rolloutPath, '{"type":"session_meta"}\n{"type":"turn"}\n', 'utf8');
+
+    const codex = new FakeCodexClient({ rolloutPath });
+    const provider = createCodexAppServerProvider({
+      client: codex,
+      defaultModel: 'gpt-test',
+      sessionStorage: () => pathToFileURL(mirrorDir).href,
+    });
+    const server = new AhpServer({ providers: [provider] });
+    const client = createClient(server);
+    client.connect();
+    await client.initialize({ clientId: 'mirror-client', protocolVersions: ['0.3.0'] });
+
+    const sessionUri = 'ahp-session:/codex-mirror';
+    await client.request('createSession', {
+      channel: sessionUri,
+      provider: 'codex',
+      workingDirectory: 'file:///workspaces/project-a',
+    });
+    const { subscription } = await client.subscribe(sessionUri);
+
+    client.dispatch(sessionUri, {
+      type: 'session/turnStarted',
+      turnId: 'mirror-turn',
+      message: userMessage('Mirror the rollout'),
+    } as StateAction);
+
+    const actions = await collectUntilTerminal(subscription);
+    assert.equal(actions.at(-1)?.type, 'session/turnComplete');
+
+    const mirroredRolloutPath = join(mirrorDir, basename(rolloutPath));
+    assert.equal(existsSync(mirroredRolloutPath), true);
+    assert.equal(readFileSync(mirroredRolloutPath, 'utf8'), readFileSync(rolloutPath, 'utf8'));
+
+    const metadata = JSON.parse(readFileSync(join(mirrorDir, 'codex-session.json'), 'utf8')) as {
+      threadId?: string;
+      model?: string;
+      sourceRolloutPath?: string;
+      mirroredRolloutPath?: string;
+      mirroredAt?: string;
+    };
+    assert.equal(metadata.threadId, 'codex-thread-1');
+    assert.equal(metadata.model, 'gpt-test');
+    assert.equal(metadata.sourceRolloutPath, rolloutPath);
+    assert.equal(metadata.mirroredRolloutPath, mirroredRolloutPath);
+    assert.equal(typeof metadata.mirroredAt, 'string');
+
+    await client.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('Codex provider routes dynamic tool calls through active-client tools', async () => {
@@ -249,6 +311,7 @@ interface RecordedRequest {
 
 interface FakeCodexClientOptions {
   readonly dynamicToolRequest?: Record<string, unknown>;
+  readonly rolloutPath?: string;
 }
 
 class FakeCodexClient implements CodexAppServerClient {
@@ -271,10 +334,15 @@ class FakeCodexClient implements CodexAppServerClient {
   async request<T = unknown>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params: params as Record<string, unknown> });
     if (method === 'thread/start') {
-      return { thread: { id: 'codex-thread-1' } } as T;
+      return { thread: { id: 'codex-thread-1', path: this.options.rolloutPath } } as T;
     }
     if (method === 'thread/resume') {
-      return { thread: { id: (params as { threadId?: string }).threadId ?? 'codex-thread-1' } } as T;
+      return {
+        thread: {
+          id: (params as { threadId?: string }).threadId ?? 'codex-thread-1',
+          path: this.options.rolloutPath,
+        },
+      } as T;
     }
     if (method === 'turn/start') {
       queueMicrotask(() => void this.completeTurn());

@@ -14,6 +14,7 @@ This package is intentionally separate from `@wyrd-company/ahp-server` so consum
 - Sends each AHP user turn with `turn/start`.
 - Maps streamed Codex assistant deltas to AHP markdown response parts and deltas.
 - Maps Codex turn completion to `session/turnComplete`.
+- Mirrors Codex rollout files into configured AHP provider session storage after completed turns.
 - Cancels turns with `turn/interrupt`.
 - Closes the Codex connection when the AHP session is disposed.
 
@@ -34,6 +35,25 @@ persisted AHP session, the adapter reconnects to Codex App Server and calls
 `thread/resume` with the stored CAS `thread.id`. The thread id is stored through
 the provider-owned resume-state hook exposed by `ahp-server`; it is not read
 from client-supplied tool input or AHP session config.
+
+## Provider Session Storage
+
+Codex App Server still owns its native storage under `CODEX_HOME/sessions`.
+When `sessionStorage` is configured, this adapter mirrors the current Codex
+rollout file into the resolved AHP provider session-storage directory after
+each completed turn and writes `codex-session.json` metadata beside it.
+
+Use a static storage URI for normal provider-kit session segmentation, or a
+function when the host needs to route each AHP session to a task-specific
+folder.
+
+```ts
+createCodexAppServerProvider({
+  socketPath: process.env.CODEX_APP_SERVER_SOCKET,
+  defaultModel: 'gpt-5',
+  sessionStorage: context => context.config?.values.taskCodexSessionUri as string | undefined,
+});
+```
 
 ## Usage
 
