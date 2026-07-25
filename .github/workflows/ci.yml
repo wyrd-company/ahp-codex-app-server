@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  intentional-check:
+    name: intentional-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Intentional derives release-unit versions from Git tags.
+          fetch-depth: 0
+
+      - name: Validate release intent state
+        uses: wyrd-company/intentional@0.1.6
+        with:
+          command: check
+          intentional-version: 0.1.6

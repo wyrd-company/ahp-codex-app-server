@@ -1,0 +1,21 @@
+$schema: https://intentional.foo/schemas/config.yml
+contract: contract-1
+settings:
+  internal-dependency-bump: patch
+  pre-1-0-bump-mapping: compatibility
+discovery:
+  managed-paths:
+  - detector: npm-package
+    path: package.json
+    release-unit: ahp-codex-app-server
+release-units:
+  ahp-codex-app-server:
+    path: .
+    projections:
+    - adapter: npm
+      file: package.json
+      mode: committed
+    tags:
+      primary:
+        role: primary
+        template: '{version}'
