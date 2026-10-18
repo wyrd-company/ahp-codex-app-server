@@ -33,7 +33,7 @@
     "verify": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "@microsoft/agent-host-protocol": "^0.3.0",
+    "@microsoft/agent-host-protocol": "^0.9.0",
     "@wyrd-company/ahp-provider-kit": "^0.4.1",
     "ws": "^8.18.0"
   },
